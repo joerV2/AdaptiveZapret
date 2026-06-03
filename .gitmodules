@@ -1,0 +1,3 @@
+[submodule "AdaptiveZapret/zapret-win-bundle"]
+	path = AdaptiveZapret/zapret-win-bundle
+	url = https://github.com/bol-van/zapret-win-bundle
