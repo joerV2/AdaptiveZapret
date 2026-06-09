@@ -3,6 +3,7 @@
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 
 #include <windows.h>
+#include <iostream>
 #include <d3d11.h>
 #include <tchar.h>
 #include <string>
@@ -55,7 +56,7 @@ static std::string g_PendingActionDomain = "";
 static std::map<int, bool> selectedRows;
 static int lastSelectedRowId = -1;
 
-static std::atomic<bool> g_GlobalStopRequested = false;  // изменено: глобальный флаг остановки
+static std::atomic<bool> g_GlobalStopRequested = false;
 
 // Для ручного добавления стратегии
 static bool showAddStrategyPopup = false;
@@ -66,6 +67,21 @@ static std::string manualAddDomainHostname = "";
 // Состояние GameFilter для каждого домена (кэш)
 static std::map<int, bool> gameFilterState;
 
+// Удалённый сканер (клиент)
+static std::string g_RemoteScannerIP = "127.0.0.1";
+static char g_RemoteScannerIPBuf[64] = "";
+static int g_RemoteScannerPort = 0;
+static char g_RemoteScannerPortBuf[16] = "";
+static bool g_RemoteScannerConnected = false;
+static bool g_RemoteScannerConnectionError = false;
+static SOCKET g_RemoteScannerSocket = INVALID_SOCKET;
+static std::mutex g_RemoteScannerMutex;
+static std::thread g_RemoteScannerThread;
+static std::atomic<bool> g_RemoteScannerStopFlag(false);
+
+// Автозапуск
+static bool g_AutoStartEnabled = false;
+
 // -------------------------------------------------------------------
 // Вспомогательная функция для получения пути к папке, где лежит .exe
 // -------------------------------------------------------------------
@@ -73,6 +89,26 @@ static fs::path GetExeDirectory() {
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     return fs::path(path).parent_path();
+}
+
+// -------------------------------------------------------------------
+// Нормализация путей к .bin файлам в стратегиях
+// -------------------------------------------------------------------
+static std::string NormalizeStrategyPaths(const std::string& strategy) {
+    std::regex binPathRegex(R"((/cygdrive/[a-zA-Z]/[^\s"]+zapret-win-bundle-master/blockcheck/zapret/)(files/fake/[^\s"]+\.bin))", std::regex::icase);
+    std::string result = strategy;
+    std::smatch match;
+    if (std::regex_search(strategy, match, binPathRegex)) {
+        std::string relativePath = match[2].str();
+        result = std::regex_replace(strategy, binPathRegex, relativePath);
+    }
+    std::regex winPathRegex(R"(([a-zA-Z]:\\[^"]+zapret-win-bundle-master\\blockcheck\\zapret\\)(files\\fake\\[^"]+\.bin))", std::regex::icase);
+    if (std::regex_search(strategy, match, winPathRegex)) {
+        std::string relativePath = match[2].str();
+        std::replace(relativePath.begin(), relativePath.end(), '\\', '/');
+        result = std::regex_replace(strategy, winPathRegex, relativePath);
+    }
+    return result;
 }
 
 // -------------------------------------------------------------------
@@ -157,16 +193,8 @@ static bool EnsureWinDivertDriver() {
 }
 
 // -------------------------------------------------------------------
-// Работа с реестром (DoH, ZAPRET, встроенный DNS браузеров)
+// Работа с реестром (DoH, ZAPRET, встроенный DNS браузеров, автозапуск)
 // -------------------------------------------------------------------
-static void SaveZapretState(bool enabled) {
-    HKEY hKey;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\AdaptiveZapret", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        DWORD val = enabled ? 1 : 0;
-        RegSetValueExA(hKey, "ZapretEnabled", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
-        RegCloseKey(hKey);
-    }
-}
 
 static bool LoadZapretState() {
     HKEY hKey;
@@ -175,6 +203,10 @@ static bool LoadZapretState() {
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\AdaptiveZapret", 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS) {
         RegQueryValueExA(hKey, "ZapretEnabled", NULL, NULL, (BYTE*)&val, &size);
         RegCloseKey(hKey);
+        OutputDebugStringA(("LoadZapretState: " + std::to_string(val == 1) + "\n").c_str());
+    }
+    else {
+        OutputDebugStringA("LoadZapretState: key not found, default false\n");
     }
     return val == 1;
 }
@@ -234,6 +266,159 @@ static void RestoreBrowserBuiltInDns() {
     RegDeleteKeyA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Edge");
 }
 
+// Функции для автозапуска
+static void SetAutoStart(bool enable) {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        if (enable) {
+            char path[MAX_PATH];
+            GetModuleFileNameA(NULL, path, MAX_PATH);
+            RegSetValueExA(hKey, "AdaptiveZapret", 0, REG_SZ, (BYTE*)path, (DWORD)strlen(path) + 1);
+        }
+        else {
+            RegDeleteValueA(hKey, "AdaptiveZapret");
+        }
+        RegCloseKey(hKey);
+    }
+    // Сохраняем настройку в реестр приложения
+    HKEY hAppKey;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\AdaptiveZapret", 0, NULL,
+        REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hAppKey, NULL) == ERROR_SUCCESS) {
+        DWORD val = enable ? 1 : 0;
+        RegSetValueExA(hAppKey, "AutoStart", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hAppKey);
+    }
+}
+
+static bool LoadAutoStartState() {
+    HKEY hKey;
+    DWORD val = 0;
+    DWORD size = sizeof(val);
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\AdaptiveZapret", 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExA(hKey, "AutoStart", NULL, NULL, (BYTE*)&val, &size);
+        RegCloseKey(hKey);
+    }
+    return val == 1;
+}
+
+// -------------------------------------------------------------------
+// RemoteScannerClient (удалённый сканер)
+// -------------------------------------------------------------------
+class RemoteScannerClient {
+public:
+    static bool Connect(const std::string& ip, int port) {
+        std::lock_guard<std::mutex> lock(g_RemoteScannerMutex);
+        if (g_RemoteScannerConnected) return true;
+
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCKET) return false;
+
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+            closesocket(sock);
+            g_RemoteScannerConnectionError = true;
+            return false;
+        }
+
+        char buffer[16];
+        int recvLen = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (recvLen <= 0 || strncmp(buffer, "ALIVE", 5) != 0) {
+            closesocket(sock);
+            g_RemoteScannerConnectionError = true;
+            return false;
+        }
+
+        g_RemoteScannerSocket = sock;
+        g_RemoteScannerConnected = true;
+        g_RemoteScannerConnectionError = false;
+        g_RemoteScannerIP = ip;
+        g_RemoteScannerPort = port;
+        return true;
+    }
+
+    static void Disconnect() {
+        std::lock_guard<std::mutex> lock(g_RemoteScannerMutex);
+        if (!g_RemoteScannerConnected) return;
+        if (g_RemoteScannerSocket != INVALID_SOCKET) {
+            closesocket(g_RemoteScannerSocket);
+            g_RemoteScannerSocket = INVALID_SOCKET;
+        }
+        g_RemoteScannerConnected = false;
+        g_RemoteScannerConnectionError = false;
+    }
+
+    static bool IsConnected() {
+        std::lock_guard<std::mutex> lock(g_RemoteScannerMutex);
+        return g_RemoteScannerConnected;
+    }
+
+    static bool HasError() {
+        std::lock_guard<std::mutex> lock(g_RemoteScannerMutex);
+        return g_RemoteScannerConnectionError && !g_RemoteScannerConnected;
+    }
+
+    static std::vector<std::string> ScanDomain(const std::string& domain, const std::string& level) {
+        SOCKET localSock = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lock(g_RemoteScannerMutex);
+            if (!g_RemoteScannerConnected || g_RemoteScannerSocket == INVALID_SOCKET) return {};
+            localSock = g_RemoteScannerSocket;
+            std::string cmd = "SCAN " + domain + " " + level + "\n";
+            if (send(localSock, cmd.c_str(), (int)cmd.size(), 0) == SOCKET_ERROR) {
+                if (g_RemoteScannerConnected) {
+                    closesocket(g_RemoteScannerSocket);
+                    g_RemoteScannerSocket = INVALID_SOCKET;
+                    g_RemoteScannerConnected = false;
+                }
+                return {};
+            }
+        }
+
+        std::vector<std::string> strategies;
+        char buffer[4096];
+        std::string line;
+        while (true) {
+            int received = recv(localSock, buffer, sizeof(buffer) - 1, 0);
+            if (received <= 0) {
+                std::lock_guard<std::mutex> lock(g_RemoteScannerMutex);
+                if (g_RemoteScannerConnected && g_RemoteScannerSocket == localSock) {
+                    closesocket(g_RemoteScannerSocket);
+                    g_RemoteScannerSocket = INVALID_SOCKET;
+                    g_RemoteScannerConnected = false;
+                }
+                return {};
+            }
+            buffer[received] = '\0';
+            line += buffer;
+            size_t pos;
+            while ((pos = line.find('\n')) != std::string::npos) {
+                std::string part = line.substr(0, pos);
+                line.erase(0, pos + 1);
+                if (part == "END") {
+                    for (auto& s : strategies) s = NormalizeStrategyPaths(s);
+                    return strategies;
+                }
+                if (part == "CANCELLED") return { "_CANCELLED_" };
+                if (part == "BUSY") return {};
+                strategies.push_back(part);
+            }
+        }
+    }
+
+    static void CancelScan() {
+        std::lock_guard<std::mutex> lock(g_RemoteScannerMutex);
+        if (!g_RemoteScannerConnected || g_RemoteScannerSocket == INVALID_SOCKET) return;
+        std::string cmd = "CANCEL\n";
+        send(g_RemoteScannerSocket, cmd.c_str(), (int)cmd.size(), 0);
+    }
+};
+
 // -------------------------------------------------------------------
 // Структура для отслеживания состояния конкретного сканирования домена
 // -------------------------------------------------------------------
@@ -253,6 +438,10 @@ public:
     static std::mutex blockcheckMutex;
 
     static void CancelCurrent(const std::string& domain) {
+        if (RemoteScannerClient::IsConnected()) {
+            RemoteScannerClient::CancelScan();
+            return;
+        }
         std::lock_guard<std::mutex> lock(scanMutex);
         auto it = activeScans.find(domain);
         if (it != activeScans.end()) {
@@ -266,6 +455,10 @@ public:
     }
 
     static void CancelAll() {
+        if (RemoteScannerClient::IsConnected()) {
+            RemoteScannerClient::CancelScan();
+            return;
+        }
         std::lock_guard<std::mutex> lock(scanMutex);
         for (auto& pair : activeScans) {
             pair.second.cancelRequested = true;
@@ -276,6 +469,10 @@ public:
     }
 
     static std::vector<std::string> RunBlockCheck(const std::string& domain) {
+        if (RemoteScannerClient::IsConnected()) {
+            return RemoteScannerClient::ScanDomain(domain, g_ScanLevel);
+        }
+
         if (g_GlobalStopRequested) return { "_CANCELLED_" };
 
         std::lock_guard<std::mutex> globalLock(blockcheckMutex);
@@ -476,6 +673,7 @@ public:
         }
         debug << "=== End of log ===\n"; debug.close();
         fs::remove(answersPath, ec);
+        for (auto& s : strategies) s = NormalizeStrategyPaths(s);
         return strategies;
     }
 };
@@ -535,9 +733,7 @@ public:
     }
 
     static void OnNewDomain(const std::string& domain, bool forceCheck = false) {
-        // Если глобальная остановка запрошена – не добавляем новые домены
         if (g_GlobalStopRequested) return;
-
         {
             std::lock_guard<std::mutex> dbLock(databaseMutex);
             if (Database::IsDomainKnown(domain)) return;
@@ -742,26 +938,14 @@ public:
     }
 
     static void GlobalStopAllScans() {
-        // Устанавливаем глобальный флаг остановки
         g_GlobalStopRequested = true;
-
-        // Помечаем все активные сканирования как отменённые пользователем
         {
             std::lock_guard<std::mutex> lock(userCancelMutex);
-            for (const auto& pair : Scanner::activeScans) {
-                userCancelledDomains.insert(pair.first);
-            }
-            // Также добавляем все домены из очереди
+            for (const auto& pair : Scanner::activeScans) userCancelledDomains.insert(pair.first);
             std::lock_guard<std::mutex> pLock(pendingMutex);
-            for (const auto& d : pendingDomains) {
-                userCancelledDomains.insert(d);
-            }
+            for (const auto& d : pendingDomains) userCancelledDomains.insert(d);
         }
-
-        // Останавливаем все процессы
         Scanner::CancelAll();
-
-        // Очищаем очереди и карты
         {
             std::lock_guard<std::mutex> lock(domainsMutex);
             scanningDomains.clear();
@@ -770,8 +954,6 @@ public:
             std::lock_guard<std::mutex> lock(pendingMutex);
             pendingDomains.clear();
         }
-
-        // Обновляем статусы в БД для доменов, которые были в состоянии "заблокирован (проверка)"
         {
             std::lock_guard<std::mutex> dbLock(databaseMutex);
             auto allDomains = Database::GetAllDomains();
@@ -781,12 +963,8 @@ public:
                 }
             }
         }
-
         newDataFlag = true;
-
-        // Запускаем поток-наблюдатель для сброса флага, когда все сканирования действительно завершатся
         std::thread([]() {
-            // Ждём, пока activeScans не опустеет (с проверкой каждые 200 мс)
             while (true) {
                 {
                     std::lock_guard<std::mutex> lock(Scanner::scanMutex);
@@ -794,14 +972,10 @@ public:
                 }
                 Sleep(200);
             }
-            // Также убеждаемся, что очереди пусты (они уже очищены, но на всякий случай)
             {
                 std::lock_guard<std::mutex> lock(DomainManager::pendingMutex);
-                if (!DomainManager::pendingDomains.empty()) {
-                    DomainManager::pendingDomains.clear();
-                }
+                if (!DomainManager::pendingDomains.empty()) DomainManager::pendingDomains.clear();
             }
-            // Сбрасываем глобальный флаг
             g_GlobalStopRequested = false;
             OutputDebugStringA("GlobalStopAllScans: all scans stopped, flag reset.\n");
             }).detach();
@@ -874,7 +1048,7 @@ std::set<std::string> DomainManager::userCancelledDomains;
 std::mutex DomainManager::userCancelMutex;
 
 // -------------------------------------------------------------------
-// Sniffer (без изменений)
+// Sniffer
 // -------------------------------------------------------------------
 class Sniffer {
 private:
@@ -942,7 +1116,7 @@ std::thread Sniffer::worker;
 HANDLE Sniffer::handle = INVALID_HANDLE_VALUE;
 
 // -------------------------------------------------------------------
-// ZapretController (без изменений, только убраны кнопки)
+// ZapretController
 // -------------------------------------------------------------------
 class ZapretController {
 private:
@@ -989,6 +1163,7 @@ public:
             if (!d.active_strategy.empty() && d.active_strategy != u8"чистый") {
                 std::string strategy = d.active_strategy;
                 if (strategy.rfind("winws ", 0) == 0) strategy = strategy.substr(6);
+                strategy = NormalizeStrategyPaths(strategy);
                 strategyDomains[strategy].push_back(d.hostname);
             }
         }
@@ -1005,13 +1180,26 @@ public:
         return true;
     }
     static bool Start() {
-        if (isRunning) return true;
-        if (!GenerateDomainLists()) return false;
+        OutputDebugStringA("ZapretController::Start called\n");
+        if (isRunning) {
+            OutputDebugStringA("ZapretController::Start: already running\n");
+            return true;
+        }
+        if (!GenerateDomainLists()) {
+            OutputDebugStringA("ZapretController::Start: GenerateDomainLists failed\n");
+            return false;
+        }
         fs::path exeDir = GetExeDirectory();
         fs::path zapretDir = exeDir / "zapret-win-bundle-master";
         fs::path winwsExe = zapretDir / "zapret-winws" / "winws.exe";
         fs::path strategiesDir = exeDir / "strategies";
-        if (!fs::exists(winwsExe)) { MessageBoxA(NULL, "winws.exe not found in zapret-win-bundle-master/zapret-winws", "Error", MB_ICONERROR); return false; }
+
+        if (!fs::exists(winwsExe)) {
+            OutputDebugStringA(("ZapretController::Start: winws.exe not found at " + winwsExe.string() + "\n").c_str());
+            MessageBoxA(NULL, "winws.exe not found in zapret-win-bundle-master/zapret-winws", "Error", MB_ICONERROR);
+            return false;
+        }
+
         std::string cmdLine = "\"" + winwsExe.string() + "\"";
         cmdLine += " --wf-tcp=80,443,2053,2083,2087,2096,8443 --wf-udp=443,19294-19344,50000-50100";
         std::vector<std::string> blocks;
@@ -1040,22 +1228,29 @@ public:
             }
         }
         if (blocks.size() == 1) cmdLine += blocks[0];
-        else if (blocks.size() > 1) { for (size_t i = 0; i < blocks.size(); ++i) { if (i == 0) cmdLine += blocks[i]; else cmdLine += " --new" + blocks[i]; } }
+        else if (blocks.size() > 1) {
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                if (i == 0) cmdLine += blocks[i];
+                else cmdLine += " --new" + blocks[i];
+            }
+        }
         OutputDebugStringA(("winws command: " + cmdLine + "\n").c_str());
         fs::path logCmdPath = exeDir / "winws_command_last.txt";
-        std::ofstream logCmd(logCmdPath); logCmd << cmdLine; logCmd.close();
+        std::ofstream logCmd(logCmdPath);
+        logCmd << cmdLine;
+        logCmd.close();
         STARTUPINFOA si = { sizeof(si) };
         PROCESS_INFORMATION pi = { 0 };
-        si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
         if (!CreateProcessA(NULL, (LPSTR)cmdLine.c_str(), NULL, NULL, FALSE, 0, NULL, zapretDir.string().c_str(), &si, &pi)) {
-            DWORD err = GetLastError();
-            char msg[256]; sprintf_s(msg, "CreateProcess failed with error %lu", err);
-            MessageBoxA(NULL, msg, "winws start error", MB_ICONERROR);
+            OutputDebugStringA("ZapretController::Start: CreateProcess failed\n");
             return false;
         }
         isRunning = true;
-        SaveZapretState(true);
-        ZapretController::pi = pi;
+        // Вместо SaveZapretState(true);
+        Database::UpdateZapretState(true);
+        OutputDebugStringA("ZapretController::Start: success\n");
         return true;
     }
     static void Stop() {
@@ -1063,7 +1258,7 @@ public:
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
         isRunning = false;
-        SaveZapretState(false);
+        Database::UpdateZapretState(false);
     }
     static void Restart() { Stop(); Start(); }
     static bool IsRunning() { return isRunning; }
@@ -1096,14 +1291,13 @@ bool DomainMatchesFilter(const DomainRecord& d, const char* filter);
 void ShowAddDomainPopup();
 static char newDomainBuffer[4096] = "";
 
-// Глобальные данные для ручного добавления стратегии
 static bool showAddStrategyModal = false;
 static char manualStrategyBuffer[4096] = "";
 static std::string manualStrategyDomain;
 static int manualStrategyDomainId = -1;
 
 // -------------------------------------------------------------------
-// Функция обновления списка доменов (загружает GameFilter из БД)
+// Функция обновления списка доменов
 // -------------------------------------------------------------------
 void RefreshDomainList() {
     domains = Database::GetAllDomains();
@@ -1141,9 +1335,7 @@ void ApplyChanges() {
             Database::UpdateGameFilter(d.hostname, gf);
         }
     }
-    for (auto& d : domains) {
-        originalStrategyIdx[d.id] = selectedStrategyIdx[d.id];
-    }
+    for (auto& d : domains) originalStrategyIdx[d.id] = selectedStrategyIdx[d.id];
     unsavedChanges = false;
     RefreshDomainList();
 }
@@ -1183,9 +1375,7 @@ void ShowAddDomainPopup() {
                 std::stringstream ss(domainsStr);
                 std::string domain;
                 while (ss >> domain) {
-                    if (!domain.empty()) {
-                        std::thread([domain]() { DomainManager::OnNewDomain(domain, true); }).detach();
-                    }
+                    if (!domain.empty()) std::thread([domain]() { DomainManager::OnNewDomain(domain, true); }).detach();
                 }
                 newDomainBuffer[0] = '\0';
                 showAddDomainPopup = false;
@@ -1348,6 +1538,45 @@ void RenderUI() {
             }
             ImGui::TextWrapped(u8"Некоторые браузеры дополнительно шифруют трафик через встроенные DNS, в основном браузеры на chromium. Для автоматического получения ссылок из таких браузеров необходимо отключать встроенные DNS. Не забудьте включить DNS обратно после использования сниффера!");
             ImGui::Separator();
+
+            // Удалённое сканирование
+            ImGui::TextWrapped(u8"Запустите внешний сканер на чистой системе для получения рабочих стратегий даже во время пользования VPN или других методов обхода.");
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::InputText(u8"IP-адрес", g_RemoteScannerIPBuf, sizeof(g_RemoteScannerIPBuf))) {
+                g_RemoteScannerIP = g_RemoteScannerIPBuf;
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80.0f);
+            if (ImGui::InputText(u8"Порт", g_RemoteScannerPortBuf, sizeof(g_RemoteScannerPortBuf), ImGuiInputTextFlags_CharsDecimal)) {
+                int newPort = atoi(g_RemoteScannerPortBuf);
+                if (newPort > 0 && newPort < 65536) g_RemoteScannerPort = newPort;
+                else if (strlen(g_RemoteScannerPortBuf) == 0) g_RemoteScannerPort = 0;
+            }
+
+            bool scanningActive = IsAnyScanActive();
+            bool snifferOn = Sniffer::IsRunning();
+            bool canToggleRemote = !scanningActive && !snifferOn;
+            if (!canToggleRemote) { ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true); ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f); }
+            if (ImGui::Button(g_RemoteScannerConnected ? u8"Отключиться" : u8"Подключиться")) {
+                if (!g_RemoteScannerConnected) RemoteScannerClient::Connect(std::string(g_RemoteScannerIP), g_RemoteScannerPort);
+                else RemoteScannerClient::Disconnect();
+            }
+            if (!canToggleRemote) { ImGui::PopItemFlag(); ImGui::PopStyleVar(); }
+            ImGui::SameLine();
+            if (g_RemoteScannerConnected) ImGui::TextColored(ImVec4(0, 1, 0, 1), u8"Подключено");
+            else if (RemoteScannerClient::HasError()) ImGui::TextColored(ImVec4(1, 0, 0, 1), u8"Ошибка подключения");
+            else ImGui::TextColored(ImVec4(0, 0, 1, 1), u8"Отключено");
+            ImGui::Separator();
+
+            // Автозапуск
+            bool autoStart = g_AutoStartEnabled;
+            if (ImGui::Checkbox(u8"Автозапуск при включении системы", &autoStart)) {
+                g_AutoStartEnabled = autoStart;
+                SetAutoStart(g_AutoStartEnabled);
+            }
+            ImGui::Separator();
+
             if (ImGui::Button(u8"Свернуть в трей", ImVec2(220, 0))) ShowWindow(GetActiveWindow(), SW_HIDE);
             if (ImGui::Button(u8"Выключить AdaptiveZapret", ImVec2(220, 0))) PostQuitMessage(0);
             ImGui::EndTabItem();
@@ -1362,10 +1591,14 @@ void RenderUI() {
                 ImGui::Separator();
             }
 
-            ImGui::InputText(u8"Поиск", searchBuffer, IM_ARRAYSIZE(searchBuffer));
+            ImGui::Text(u8"Поиск:");
+            ImGui::SameLine();
+            ImGui::InputText(u8"##search", searchBuffer, IM_ARRAYSIZE(searchBuffer));
+            ImGui::SameLine();
+            ImGui::Text(u8"Режим сканирования:");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(100.0f);
-            if (ImGui::BeginCombo(u8" ", g_ScanLevel.c_str(), 0)) {
+            if (ImGui::BeginCombo(u8"##scanlevel", g_ScanLevel.c_str(), 0)) {
                 if (ImGui::Selectable("quick", g_ScanLevel == "quick")) g_ScanLevel = "quick";
                 if (ImGui::Selectable("standard", g_ScanLevel == "standard")) g_ScanLevel = "standard";
                 ImGui::EndCombo();
@@ -1424,7 +1657,6 @@ void RenderUI() {
             }
             ImGui::SameLine();
 
-            // Изменённая кнопка "Остановить все проверки" – вызывает новый метод
             if (ImGui::Button(u8"Остановить все проверки")) {
                 DomainManager::GlobalStopAllScans();
                 RefreshDomainList();
@@ -1475,7 +1707,6 @@ void RenderUI() {
 
                 for (auto& d : domains) {
                     if (!DomainMatchesFilter(d, searchBuffer)) continue;
-
                     ImGui::TableNextRow();
 
                     ImGui::TableSetColumnIndex(0);
@@ -1487,9 +1718,7 @@ void RenderUI() {
                             if (start > end) std::swap(start, end);
                             for (int i = start; i <= end; ++i) selectedRows[i] = checked;
                         }
-                        else {
-                            selectedRows[d.id] = checked;
-                        }
+                        else selectedRows[d.id] = checked;
                         lastSelectedRowId = d.id;
                     }
 
@@ -1501,10 +1730,7 @@ void RenderUI() {
 
                     ImGui::TableSetColumnIndex(3);
                     bool isScanning = false;
-                    {
-                        std::lock_guard<std::mutex> lock(DomainManager::domainsMutex);
-                        isScanning = (scanningDomains.find(d.hostname) != scanningDomains.end());
-                    }
+                    { std::lock_guard<std::mutex> lock(DomainManager::domainsMutex); isScanning = (scanningDomains.find(d.hostname) != scanningDomains.end()); }
                     if (isScanning) {
                         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), u8"Идёт проверка...");
                     }
@@ -1521,9 +1747,7 @@ void RenderUI() {
                             }
                             if (snifferOn) { ImGui::PopItemFlag(); ImGui::PopStyleVar(); }
                         }
-                        else {
-                            ImGui::TextDisabled(u8"нет стратегий");
-                        }
+                        else ImGui::TextDisabled(u8"нет стратегий");
                     }
 
                     ImGui::TableSetColumnIndex(4);
@@ -1535,15 +1759,12 @@ void RenderUI() {
                         }
                         if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"Применять выбранную стратегию к игровым портам");
                     }
-                    else {
-                        ImGui::TextDisabled(u8"---");
-                    }
+                    else ImGui::TextDisabled(u8"---");
 
                     ImGui::TableSetColumnIndex(5);
                     if (!snifferOn) {
                         bool isPending = false;
                         { std::lock_guard<std::mutex> pLock(DomainManager::pendingMutex); isPending = (std::find(DomainManager::pendingDomains.begin(), DomainManager::pendingDomains.end(), d.hostname) != DomainManager::pendingDomains.end()); }
-
                         if (isScanning || isPending) {
                             if (ImGui::Button((u8"Отмена##" + std::to_string(d.id)).c_str())) {
                                 g_PendingActionDomain = d.hostname;
@@ -1577,9 +1798,7 @@ void RenderUI() {
                             if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"Добавить стратегию вручную");
                         }
                     }
-                    else {
-                        ImGui::TextDisabled(u8"---");
-                    }
+                    else ImGui::TextDisabled(u8"---");
                 }
                 ImGui::EndTable();
             }
@@ -1589,24 +1808,15 @@ void RenderUI() {
             ImGui::Text(u8"С отмеченными:");
             ImGui::SameLine();
 
-            if (scanningActive) {
-                ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
-                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
-            }
-
-            if (ImGui::Button(u8"Повторная проверка")) {
-                ImGui::OpenPopup(u8"ConfirmMassRecheck");
-            }
+            if (scanningActive) { ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true); ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f); }
+            if (ImGui::Button(u8"Повторная проверка")) ImGui::OpenPopup(u8"ConfirmMassRecheck");
             if (ImGui::BeginPopupModal(u8"ConfirmMassRecheck", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::Text(u8"Запустить повторную проверку для выбранных доменов?");
                 if (ImGui::Button(u8"Да")) {
                     for (auto& pair : selectedRows) {
                         if (pair.second) {
                             for (const auto& d : domains) {
-                                if (d.id == pair.first) {
-                                    DomainManager::ForceRecheckDomain(d.hostname);
-                                    break;
-                                }
+                                if (d.id == pair.first) { DomainManager::ForceRecheckDomain(d.hostname); break; }
                             }
                             pair.second = false;
                         }
@@ -1619,19 +1829,14 @@ void RenderUI() {
             }
             ImGui::SameLine();
 
-            if (ImGui::Button(u8"Удалить")) {
-                ImGui::OpenPopup(u8"ConfirmMassDelete");
-            }
+            if (ImGui::Button(u8"Удалить")) ImGui::OpenPopup(u8"ConfirmMassDelete");
             if (ImGui::BeginPopupModal(u8"ConfirmMassDelete", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::Text(u8"Удалить выбранные записи? Это действие необратимо.");
                 if (ImGui::Button(u8"Удалить")) {
                     for (auto& pair : selectedRows) {
                         if (pair.second) {
                             for (const auto& d : domains) {
-                                if (d.id == pair.first) {
-                                    DomainManager::DeleteDomain(d.hostname);
-                                    break;
-                                }
+                                if (d.id == pair.first) { DomainManager::DeleteDomain(d.hostname); break; }
                             }
                             pair.second = false;
                         }
@@ -1644,10 +1849,7 @@ void RenderUI() {
                 ImGui::EndPopup();
             }
 
-            if (scanningActive) {
-                ImGui::PopItemFlag();
-                ImGui::PopStyleVar();
-            }
+            if (scanningActive) { ImGui::PopItemFlag(); ImGui::PopStyleVar(); }
 
             ImGui::Separator();
             if (ImGui::Button(u8"Вернуть автоскролл")) logAutoScroll = true;
@@ -1661,9 +1863,7 @@ void RenderUI() {
                 while (std::getline(logFile, line)) content += line + "\n";
                 ImGui::TextUnformatted(content.c_str());
             }
-            else {
-                ImGui::TextDisabled(u8"Нет лога проверки.");
-            }
+            else ImGui::TextDisabled(u8"Нет лога проверки.");
             if (logAutoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 5.0f) ImGui::SetScrollHereY(1.0f);
             if (ImGui::IsWindowHovered() && ImGui::GetIO().MouseWheel != 0.0f) logAutoScroll = false;
             if (ImGui::IsWindowFocused() && !ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::GetScrollY() < ImGui::GetScrollMaxY() - 5.0f) logAutoScroll = false;
@@ -1721,7 +1921,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
     if (!EnsureWinDivertDriver()) MessageBoxW(NULL, L"Не удалось установить/запустить драйвер WinDivert.\nСниффер не будет работать.", L"Ошибка", MB_ICONERROR);
     WSADATA wsaData; WSAStartup(MAKEWORD(2, 2), &wsaData);
-    Database::InitDB(); RefreshDomainList();
+    Database::InitDB();
+    strcpy_s(g_RemoteScannerIPBuf, g_RemoteScannerIP.c_str());
+    snprintf(g_RemoteScannerPortBuf, sizeof(g_RemoteScannerPortBuf), "%d", g_RemoteScannerPort);
+    g_AutoStartEnabled = LoadAutoStartState();
+    RefreshDomainList();
 
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, hInstance, NULL, NULL, NULL, NULL, _T("AdaptiveZapretApp"), NULL };
     RegisterClassEx(&wc);
@@ -1731,12 +1935,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     SetWindowPos(hwnd, NULL, (GetSystemMetrics(SM_CXSCREEN) - (rc.right - rc.left)) / 2, (GetSystemMetrics(SM_CYSCREEN) - (rc.bottom - rc.top)) / 2, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClass(wc.lpszClassName, wc.hInstance); WSACleanup(); Database::CloseDB(); return 1; }
     ShowWindow(hwnd, SW_HIDE); UpdateWindow(hwnd);
-    TrayIcon::Init(hwnd); TrayIcon::ShowBalloon(hwnd, L"AdaptiveZapret", L"Приложение запущено и готово к работе. Для доступа к интерфейсу нажмите на иконку в трее.", NIIF_INFO);
+    TrayIcon::Init(hwnd);
+    TrayIcon::ShowBalloon(hwnd, L"AdaptiveZapret", L"Приложение запущено и готово к работе. Для доступа к интерфейсу нажмите на иконку в трее.", NIIF_INFO);
     IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/arial.ttf", 16.0f, nullptr, io.Fonts->GetGlyphRangesCyrillic());
     ImGui_ImplWin32_Init(hwnd); ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-    if (LoadZapretState()) ZapretController::Start();
+    if (Database::GetZapretState()) {
+        OutputDebugStringA("WinMain: Database::GetZapretState true, calling ZapretController::Start\n");
+        if (!ZapretController::Start()) {
+            OutputDebugStringA("WinMain: ZapretController::Start failed\n");
+            MessageBoxA(NULL, "Не удалось запустить ZAPRET автоматически. Проверьте наличие zapret-win-bundle-master.", "Ошибка", MB_ICONWARNING);
+        }
+    }
+    else {
+        OutputDebugStringA("WinMain: Database::GetZapretState false, not starting Zapret\n");
+    }
     bool dohEnabled = LoadDoHState(); SetSystemDoH(dohEnabled);
     DWORD lastUpdateTime = GetTickCount(); bool done = false;
     const float clear_color[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
@@ -1752,11 +1966,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_pSwapChain->Present(1, 0);
     }
-    SaveZapretState(ZapretController::IsRunning());
-    Sniffer::Stop(); ZapretController::Stop(); StopWinDivertService();
-    ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
-    CleanupDeviceD3D(); DestroyWindow(hwnd); UnregisterClass(wc.lpszClassName, wc.hInstance);
-    Database::CloseDB(); WSACleanup();
+
+    // ========== ИСПРАВЛЕННАЯ ЗАВЕРШАЮЩАЯ ЧАСТЬ ==========
+    // Сохраняем текущее состояние ZAPRET в БД (без остановки процесса, он умрёт сам)
+    Database::UpdateZapretState(ZapretController::IsRunning());
+
+    // Останавливаем сниффер и драйвер (Zapret не останавливаем, просто сохраняем состояние)
+    Sniffer::Stop();
+    StopWinDivertService();
+
+    // Очистка ImGui и DirectX
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    CleanupDeviceD3D();
+    DestroyWindow(hwnd);
+    UnregisterClass(wc.lpszClassName, wc.hInstance);
+    Database::CloseDB();
+    WSACleanup();
     return 0;
 }
 

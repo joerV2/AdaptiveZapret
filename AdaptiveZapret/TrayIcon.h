@@ -11,7 +11,7 @@ public:
         nid.uID = 1;
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_USER + 1;
-        nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
         // Исправлено: добавлены L и размер буфера
         wcscpy_s(nid.szTip, L"AdaptiveZapret");
         Shell_NotifyIcon(NIM_ADD, &nid);

@@ -19,7 +19,10 @@ bool Database::InitDB() {
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "domain_id INTEGER, "
         "args TEXT NOT NULL, "
-        "FOREIGN KEY(domain_id) REFERENCES Domains(id) ON DELETE CASCADE);";
+        "FOREIGN KEY(domain_id) REFERENCES Domains(id) ON DELETE CASCADE);"
+        "CREATE TABLE IF NOT EXISTS Settings ("
+        "key TEXT PRIMARY KEY, "
+        "value TEXT);";
 
     char* errMsg = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &errMsg) != SQLITE_OK) {
@@ -206,4 +209,36 @@ bool Database::GetGameFilter(const std::string& hostname) {
         sqlite3_finalize(stmt);
     }
     return enabled;
+}
+
+bool Database::GetZapretState() {
+    const char* sql = "SELECT value FROM Settings WHERE key = 'zapret_enabled';";
+    sqlite3_stmt* stmt;
+    bool enabled = false;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char* text = sqlite3_column_text(stmt, 0);
+            if (text) {
+                std::string val = reinterpret_cast<const char*>(text);
+                enabled = (val == "1");
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    return enabled;
+}
+
+bool Database::UpdateZapretState(bool enabled) {
+    const char* sql = "INSERT OR REPLACE INTO Settings (key, value) VALUES ('zapret_enabled', ?);";
+    sqlite3_stmt* stmt;
+    bool success = false;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        std::string val = enabled ? "1" : "0";
+        sqlite3_bind_text(stmt, 1, val.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_DONE) {
+            success = true;
+        }
+        sqlite3_finalize(stmt);
+    }
+    return success;
 }

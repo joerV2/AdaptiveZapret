@@ -34,4 +34,8 @@ public:
     static bool AddStrategy(int domain_id, const std::string& strategy);
     static std::vector<std::string> GetStrategiesForDomain(int domain_id);
     static bool ClearStrategiesForDomain(int domain_id);
+
+    // Настройки приложения (сохранение состояния чекбоксов)
+    static bool GetZapretState();
+    static bool UpdateZapretState(bool enabled);
 };
