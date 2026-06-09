@@ -9,14 +9,14 @@ bool Database::InitDB() {
         return false;
     }
 
-    // —оздаЄм таблицы (если их нет)
+    // »справленный CREATE TABLE Ц столбец game_filter внутри таблицы Domains
     const char* sql =
         "CREATE TABLE IF NOT EXISTS Domains ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "hostname TEXT UNIQUE NOT NULL, "
         "status TEXT NOT NULL, "
-        "active_strategy TEXT);"
-
+        "active_strategy TEXT, "
+        "game_filter INTEGER DEFAULT 0);"
         "CREATE TABLE IF NOT EXISTS Strategies ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "domain_id INTEGER, "
@@ -55,7 +55,7 @@ bool Database::IsDomainKnown(const std::string& hostname) {
 
 bool Database::AddDomain(const std::string& hostname, const std::string& status) {
     if (IsDomainKnown(hostname)) return false;
-    const char* sql = "INSERT INTO Domains (hostname, status, active_strategy) VALUES (?, ?, '');";
+    const char* sql = "INSERT INTO Domains (hostname, status, active_strategy, game_filter) VALUES (?, ?, '', 0);";
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, hostname.c_str(), -1, SQLITE_TRANSIENT);
@@ -95,7 +95,7 @@ bool Database::UpdateActiveStrategy(const std::string& hostname, const std::stri
 
 std::vector<DomainRecord> Database::GetAllDomains() {
     std::vector<DomainRecord> records;
-    const char* sql = "SELECT id, hostname, status, active_strategy FROM Domains;";
+    const char* sql = "SELECT id, hostname, status, active_strategy, game_filter FROM Domains;";
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -104,6 +104,7 @@ std::vector<DomainRecord> Database::GetAllDomains() {
             rec.hostname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
             rec.status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
             rec.active_strategy = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            rec.game_filter = sqlite3_column_int(stmt, 4) != 0;
             records.push_back(rec);
         }
         sqlite3_finalize(stmt);
@@ -112,8 +113,8 @@ std::vector<DomainRecord> Database::GetAllDomains() {
 }
 
 DomainRecord Database::GetDomainByHostname(const std::string& hostname) {
-    DomainRecord rec{ -1, "", "", "" };
-    const char* sql = "SELECT id, hostname, status, active_strategy FROM Domains WHERE hostname = ?;";
+    DomainRecord rec{ -1, "", "", "", false };
+    const char* sql = "SELECT id, hostname, status, active_strategy, game_filter FROM Domains WHERE hostname = ?;";
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, hostname.c_str(), -1, SQLITE_TRANSIENT);
@@ -122,6 +123,7 @@ DomainRecord Database::GetDomainByHostname(const std::string& hostname) {
             rec.hostname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
             rec.status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
             rec.active_strategy = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            rec.game_filter = sqlite3_column_int(stmt, 4) != 0;
         }
         sqlite3_finalize(stmt);
     }
@@ -178,4 +180,32 @@ bool Database::ClearStrategiesForDomain(int domain_id) {
         return true;
     }
     return false;
+}
+
+// ---------- GameFilter ----------
+bool Database::UpdateGameFilter(const std::string& hostname, bool enabled) {
+    const char* sql = "UPDATE Domains SET game_filter = ? WHERE hostname = ?;";
+    sqlite3_stmt* stmt;
+    bool success = false;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, enabled ? 1 : 0);
+        sqlite3_bind_text(stmt, 2, hostname.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_DONE) success = true;
+        sqlite3_finalize(stmt);
+    }
+    return success;
+}
+
+bool Database::GetGameFilter(const std::string& hostname) {
+    const char* sql = "SELECT game_filter FROM Domains WHERE hostname = ?;";
+    sqlite3_stmt* stmt;
+    bool enabled = false;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, hostname.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            enabled = sqlite3_column_int(stmt, 0) != 0;
+        }
+        sqlite3_finalize(stmt);
+    }
+    return enabled;
 }

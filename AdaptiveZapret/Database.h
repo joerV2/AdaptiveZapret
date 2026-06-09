@@ -8,6 +8,7 @@ struct DomainRecord {
     std::string hostname;
     std::string status;
     std::string active_strategy;
+    bool game_filter;          // добавлено поле GameFilter
 };
 
 class Database {
@@ -25,7 +26,9 @@ public:
     static bool UpdateActiveStrategy(const std::string& hostname, const std::string& strategy);
     static std::vector<DomainRecord> GetAllDomains();
     static DomainRecord GetDomainByHostname(const std::string& hostname);
-    static bool DeleteDomain(const std::string& hostname); // опционально
+    static bool DeleteDomain(const std::string& hostname);
+    static bool UpdateGameFilter(const std::string& hostname, bool enabled);
+    static bool GetGameFilter(const std::string& hostname);   // новый метод
 
     // —тратегии (найденные решени€)
     static bool AddStrategy(int domain_id, const std::string& strategy);
