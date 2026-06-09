@@ -8,8 +8,6 @@ bool Database::InitDB() {
         std::cerr << "[DB ERROR] Can't open database: " << sqlite3_errmsg(db) << std::endl;
         return false;
     }
-
-    // »справленный CREATE TABLE Ц столбец game_filter внутри таблицы Domains
     const char* sql =
         "CREATE TABLE IF NOT EXISTS Domains ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
