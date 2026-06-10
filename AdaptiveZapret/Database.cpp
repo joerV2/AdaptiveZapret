@@ -242,3 +242,33 @@ bool Database::UpdateZapretState(bool enabled) {
     }
     return success;
 }
+
+bool Database::GetAutoScanState() {
+    const char* sql = "SELECT value FROM Settings WHERE key = 'auto_scan';";
+    sqlite3_stmt* stmt;
+    bool enabled = true;  // по умолчанию true
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char* text = sqlite3_column_text(stmt, 0);
+            if (text) {
+                std::string val = reinterpret_cast<const char*>(text);
+                enabled = (val == "1");
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    return enabled;
+}
+
+bool Database::UpdateAutoScanState(bool enabled) {
+    const char* sql = "INSERT OR REPLACE INTO Settings (key, value) VALUES ('auto_scan', ?);";
+    sqlite3_stmt* stmt;
+    bool success = false;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        std::string val = enabled ? "1" : "0";
+        sqlite3_bind_text(stmt, 1, val.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_DONE) success = true;
+        sqlite3_finalize(stmt);
+    }
+    return success;
+}

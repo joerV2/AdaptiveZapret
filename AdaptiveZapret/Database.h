@@ -38,4 +38,7 @@ public:
     // Настройки приложения (сохранение состояния чекбоксов)
     static bool GetZapretState();
     static bool UpdateZapretState(bool enabled);
+
+    static bool GetAutoScanState();
+    static bool UpdateAutoScanState(bool enabled);
 };
